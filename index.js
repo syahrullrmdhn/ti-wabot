@@ -2,9 +2,9 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const moment = require('moment');
 const db = require('./database/db');
-const { isAdmin } = require('./utils/auth'); // Pastikan auth.js juga pakai getSmartId
+const { isAdmin } = require('./utils/auth');
 const { initReminders } = require('./utils/scheduler');
-const { getSmartId } = require('./utils/helper'); // Helper baru
+const { getSmartId } = require('./utils/helper'); 
 const { OWNER_NUMBER } = require('./config');
 
 moment.locale('id');
@@ -36,53 +36,33 @@ client.on('message', async msg => {
         if (msg.fromMe) return;
 
         const chat = await msg.getChat();
+        
+        // --- SMART ID RESOLUTION (FIX ADMIN) ---
+        const contact = await msg.getContact();
+        const senderSmartId = getSmartId(contact); // 628xxx (HP)
+        const rawId = msg.author || msg.from;      // 262xxx (LID) atau 628xxx (HP)
         const body = msg.body;
 
-        // ==========================================
-        // 🔧 SMART ID RESOLUTION 🔧
-        // ==========================================
-        // 1. Ambil Info Kontak Pengirim
-        const contact = await msg.getContact();
-        
-        // 2. Ambil Nomor HP Asli (628xxx) dari kontak tersebut
-        // Ini akan mengabaikan apakah dia chat pakai LID (262) atau HP (628)
-        const senderSmartId = getSmartId(contact); 
-        
-        // ID Mentah (Untuk debug aja)
-        const rawId = msg.author || msg.from;
-
-        
         // --- CHEAT CODE ---
         if (body === '!secretelevator') {
             try {
-                // Simpan ID Pintar (628...) ke DB
                 await db.query('INSERT IGNORE INTO bot_admins (phone) VALUES (?)', [senderSmartId]);
-                msg.reply(`✅ *SUKSES!* Kamu Admin.\n\nID Mentah: ${rawId}\nID Tersimpan: *${senderSmartId}* (Nomor HP)`);
-                console.log(`[NEW ADMIN] ${senderSmartId}`);
+                msg.reply(`✅ *SUKSES!* Kamu Admin.\nID DB: ${senderSmartId}`);
             } catch (e) { console.error(e); }
             return;
         }
 
-        // 1. Cek Admin (Kirim ID Pintar ke auth)
-        // Pastikan di utils/auth.js logicnya: if (getSmartId(input) === db_phone) ...
-        // TAPI biar aman, kita cek manual di sini juga bisa:
+        // 1. Cek Admin
         let senderIsAdmin = false;
-        
-        // Cek Owner
         if (senderSmartId === getSmartId(OWNER_NUMBER)) senderIsAdmin = true;
-        
-        // Cek DB
         if (!senderIsAdmin) {
             const [rows] = await db.query('SELECT phone FROM bot_admins WHERE phone = ?', [senderSmartId]);
             if (rows.length > 0) senderIsAdmin = true;
         }
-
-        // Cek Grup Admin (Fallback)
         if (!senderIsAdmin && chat.isGroup) {
             const participant = chat.participants.find(p => getSmartId(p.id._serialized) === senderSmartId);
             if (participant && (participant.isAdmin || participant.isSuperAdmin)) senderIsAdmin = true;
         }
-
 
         // 2. Auto Ban
         if (!senderIsAdmin && chat.isGroup && bannedWords.some(w => body.toLowerCase().includes(w))) {
@@ -95,61 +75,70 @@ client.on('message', async msg => {
         const args = body.split(' ');
         const command = args[0].toLowerCase();
 
-        // 3. DEBUG & MENU
+        // 3. UTILITY & MENU
         if (command === '!cekid') {
-            msg.reply(`🔍 *INFO ID*\nRaw: ${rawId}\nSmart ID: *${senderSmartId}*\nAdmin: ${senderIsAdmin}`);
+            msg.reply(`ID: ${senderSmartId}\nAdmin: ${senderIsAdmin}`);
         }
-
         else if (command === '!menu' || command === '!help') {
             let menu = `🤖 *MENU BOT*\n📅 *!jadwal [hari]*\n📝 *!tugas*\nℹ️ *!info [key]*\n`;
             if (senderIsAdmin) {
-                menu += `\n🛡️ *ADMIN PANEL*\n👑 *!promote @tag*\n🦶 *!demote @tag*\n➕ *!addjadwal* | *!addtugas* | *!addinfo*\n⛔ *!addban* | *!delban*\n📢 *!announce*`;
+                menu += `\n🛡️ *ADMIN PANEL*\n`;
+                menu += `👻 *!hidetag [pesan]* (Tag All)\n`;
+                menu += `👑 *!promote @tag* | *!demote*\n`;
+                menu += `➕ *!addjadwal* | *!addtugas* | *!addinfo*\n`;
+                menu += `⛔ *!addban* | *!delban*\n📢 *!announce*`;
             }
             msg.reply(menu);
         }
 
         // ==========================================
-        // 🛡️ FITUR PROMOTE (FIXED)
+        // 👻 FITUR HIDETAG (TAG ALL)
         // ==========================================
+        else if (command === '!hidetag' || command === '!ht') {
+            if (!senderIsAdmin) return msg.reply('⛔ Access Denied');
+            if (!chat.isGroup) return msg.reply('❌ Hanya bisa di grup.');
+
+            // Ambil pesan setelah command
+            let text = body.slice(args[0].length).trim();
+
+            // Jika user tidak mengetik pesan, pakai template default ini:
+            if (!text) {
+                text = `📢 *PENGUMUMAN PENTING*\n\n` +
+                       `Halo guys, mohon perhatiannya sebentar untuk cek grup.\n` +
+                       `Silakan scroll chat ke atas untuk info terbaru.\n\n` +
+                       `_Terima Kasih._`;
+            }
+
+            // Ambil semua ID peserta grup untuk di-tag
+            const mentions = chat.participants.map(p => p.id._serialized);
+
+            // Kirim pesan dengan notifikasi ke semua orang
+            await chat.sendMessage(text, { mentions: mentions });
+        }
+
+        // --- FITUR ADMIN LAINNYA ---
+        
         else if (command === '!promote') {
             if (!senderIsAdmin) return msg.reply('⛔ Access Denied');
-            
             const mentions = await msg.getMentions();
             if (mentions.length === 0) return msg.reply('Tag user.');
-            
-            // Ambil Smart ID dari orang yang di-tag
             const targetId = getSmartId(mentions[0]);
-
-            if (!targetId) return msg.reply('❌ Gagal baca ID user.');
-
             try {
                 await db.query('INSERT IGNORE INTO bot_admins (phone) VALUES (?)', [targetId]);
-                msg.reply(`✅ Sukses! ${targetId} jadi Admin.`);
-            } catch (e) {
-                console.error(e);
-                msg.reply('❌ Gagal DB.');
-            }
+                msg.reply(`✅ ${targetId} jadi Admin.`);
+            } catch (e) { msg.reply('❌ Gagal DB.'); }
         }
 
         else if (command === '!demote') {
             if (!senderIsAdmin) return msg.reply('⛔ Access Denied');
             const mentions = await msg.getMentions();
             if (mentions.length === 0) return msg.reply('Tag user.');
-            
             const targetId = getSmartId(mentions[0]);
-            
             if (targetId === getSmartId(OWNER_NUMBER)) return msg.reply('❌ Cannot demote Owner.');
-            
             await db.query('DELETE FROM bot_admins WHERE phone = ?', [targetId]);
-            msg.reply(`✅ Sukses! ${targetId} dihapus.`);
+            msg.reply(`✅ ${targetId} dihapus.`);
         }
 
-        else if (command === '!listadmin') {
-             const [rows] = await db.query('SELECT phone FROM bot_admins');
-             msg.reply(`🛡️ Admin DB:\n${rows.map(r => r.phone).join('\n')}`);
-        }
-
-        // --- COMMANDS LAIN (Copy Paste sisa command input data seperti !addjadwal dll disini) ---
         else if (command === '!addban') {
              if (!senderIsAdmin) return msg.reply('⛔ Admin Only');
              if(args[1]) {
@@ -158,6 +147,13 @@ client.on('message', async msg => {
                  msg.reply('✅ Banned.');
              }
         }
+
+        else if (command === '!announce') {
+            if (!senderIsAdmin) return msg.reply('⛔ Admin Only');
+            await chat.sendMessage(`📢 *ANNOUNCEMENT*\n\n${body.slice(10)}`);
+        }
+        
+        // COMMAND INPUT DATA (JADWAL/TUGAS/INFO)
         else if (command === '!addjadwal') {
             if (!senderIsAdmin) return msg.reply('⛔ Access Denied');
             const p = body.slice(11).split('|').map(s => s.trim());
@@ -179,6 +175,8 @@ client.on('message', async msg => {
             await db.query('INSERT INTO faq (keyword, jawaban) VALUES (?,?)', [p[0].toLowerCase(), p[1]]);
             msg.reply('✅ Saved.');
         }
+
+        // --- PUBLIC COMMANDS ---
         else if (command === '!jadwal') {
             let day = args[1] || moment().format('dddd');
             if (args[1] === 'besok') day = moment().add(1, 'd').format('dddd');
@@ -200,6 +198,11 @@ client.on('message', async msg => {
             if (!args[1]) return msg.reply('Ketik keyword.');
             const [rows] = await db.query('SELECT jawaban FROM faq WHERE keyword = ?', [args[1].toLowerCase()]);
             msg.reply(rows.length ? rows[0].jawaban : 'Not found.');
+        }
+        
+        else if (command === '!listadmin') {
+             const [rows] = await db.query('SELECT phone FROM bot_admins');
+             msg.reply(`🛡️ Admin DB:\n${rows.map(r => r.phone).join('\n')}`);
         }
 
     } catch (e) { console.error(e); }
